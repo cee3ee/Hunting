@@ -28,7 +28,7 @@ Hunter is a Meteor Client addon that automates the process of finding, traveling
 1. Clone the repository:
    ```bash
    git clone https://github.com/Meteor-Hunting/Hunting.git
-   cd SpawnerHunt
+   cd Hunting
    ```
 2. Build the JAR:
    ```bash

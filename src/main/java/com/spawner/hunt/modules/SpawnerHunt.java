@@ -17,11 +17,9 @@ import meteordevelopment.meteorclient.utils.render.RenderUtils;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.world.level.ChunkPos;
-import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.SharedConstants;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Registry;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.tags.ItemTags;
@@ -41,6 +39,20 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+// Requires GraalJS Polyglot + JS runtime dependencies in build.gradle.
+
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Source;
+import org.graalvm.polyglot.Value;
+import org.graalvm.polyglot.proxy.ProxyExecutable;
 
 public class SpawnerHunt extends Module {
     private static final int PICKUP_TIMEOUT_TICKS = 200;
@@ -260,6 +272,10 @@ public class SpawnerHunt extends Module {
         matchingSpawners.clear();
         fallbackEntityIdCache.clear();
         packetedDungeons.clear();
+        predictedDungeons.clear();
+        lastDungeonScanChunkX = Integer.MIN_VALUE;
+        lastDungeonScanChunkZ = Integer.MIN_VALUE;
+        lastDungeonScanSeed = null;
         currentTarget = null;
         clearExploration();
         clearPickupVerification();
@@ -299,8 +315,16 @@ public class SpawnerHunt extends Module {
             return;
         }
 
-        if (DungeonPacketmethod.get() && mc.player.tickCount % 20 == 0) {
-            ScanDungeonAttempts();
+        if (DungeonPacketmethod.get()) {
+            int playerChunkX = Math.floorDiv(mc.player.getBlockX(), 16);
+            int playerChunkZ = Math.floorDiv(mc.player.getBlockZ(), 16);
+            String seed = worldSeed.get().trim();
+            if (mc.player.tickCount % 20 == 0
+                && (playerChunkX != lastDungeonScanChunkX
+                || playerChunkZ != lastDungeonScanChunkZ
+                || !seed.equals(lastDungeonScanSeed))) {
+                ScanDungeonAttempts();
+            }
         }
 
         if (rtpCooldown > 0) rtpCooldown--;
@@ -515,80 +539,113 @@ public class SpawnerHunt extends Module {
         }
     }
 
-    private final Setting<Integer> worldSeed = sgStealth.add(new IntSetting.Builder()
+    private final Setting<String> worldSeed = sgStealth.add(new StringSetting.Builder()
         .name("world-seed")
-        .description("The known world seed used to calculate dungeon coordinates.")
-        .defaultValue(0)
-        .sliderRange(-30000000, 30000000)
+        .description("The known 64-bit world seed used by the bundled dungeon finder.")
+        .defaultValue("0")
         .build()
     );
+
+    /** Predicted dungeons returned by the bundled Chunkbase worker/WASM. */
+    private final List<PredictedDungeon> predictedDungeons = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final ChunkbaseDungeonFinder dungeonFinder = new ChunkbaseDungeonFinder();
+    private int lastDungeonScanChunkX = Integer.MIN_VALUE;
+    private int lastDungeonScanChunkZ = Integer.MIN_VALUE;
+    private String lastDungeonScanSeed;
 
     private void ScanDungeonAttempts() {
         if (mc.level == null || mc.player == null) return;
 
-        var registry = mc.level.registryAccess().lookup(Registries.PLACED_FEATURE).orElse(null);
-        if (registry == null) return;
+        String seedText = worldSeed.get().trim();
+        if (seedText.isEmpty() || !seedText.matches("[-+]?\\d+")) {
+            MeteorClient.LOG.warn("[SpawnerHunt] Invalid world seed: {}", seedText);
+            return;
+        }
 
-        var keys = registry.listElementIds().toList();
-        var monsterRoomKey = keys.stream()
-            .filter(k -> k.toString().contains("monster_room"))
-            .findFirst().orElse(null);
-        if (monsterRoomKey == null) return;
+        final long seed;
+        try {
+            seed = Long.parseLong(seedText);
+        } catch (NumberFormatException e) {
+            MeteorClient.LOG.warn("[SpawnerHunt] World seed is outside signed 64-bit range: {}", seedText);
+            return;
+        }
 
-        int featureIdx = keys.indexOf(monsterRoomKey);
-        if (featureIdx == -1) return;
+        final int centerChunkX = Math.floorDiv(mc.player.getBlockX(), 16);
+        final int centerChunkZ = Math.floorDiv(mc.player.getBlockZ(), 16);
+        lastDungeonScanChunkX = centerChunkX;
+        lastDungeonScanChunkZ = centerChunkZ;
+        lastDungeonScanSeed = seedText;
 
-        int playerChunkX = mc.player.getBlockX() >> 4;
-        int playerChunkZ = mc.player.getBlockZ() >> 4;
-        int chunkRadius = 3;
+        int javaVersion = resolveWorkerJavaVersion();
+        int queryX = mc.player.getBlockX();
+        int queryZ = mc.player.getBlockZ();
 
-        long seed = worldSeed.get();
-        if (seed == 0) return; // Need a seed to predict
+        dungeonFinder.findDungeons(seed, javaVersion, queryX, queryZ)
+            .whenComplete((dungeons, throwable) -> mc.execute(() -> {
+                if (throwable != null) {
+                    MeteorClient.LOG.error("[SpawnerHunt] Dungeon finder failed", throwable);
+                    return;
+                }
 
-        // Initialize Minecraft's native ChunkRandom with the modern Xoroshiro128++ engine
-        net.minecraft.world.level.levelgen.XoroshiroRandomSource xoroshiroRandom = new net.minecraft.world.level.levelgen.XoroshiroRandomSource(0L);
-        net.minecraft.world.level.levelgen.WorldgenRandom random = new net.minecraft.world.level.levelgen.WorldgenRandom(xoroshiroRandom);
+                predictedDungeons.clear();
+                predictedDungeons.addAll(dungeons);
 
-        for (int chunkX = playerChunkX - chunkRadius; chunkX <= playerChunkX + chunkRadius; chunkX++) {
-            for (int chunkZ = playerChunkZ - chunkRadius; chunkZ <= playerChunkZ + chunkRadius; chunkZ++) {
+                MeteorClient.LOG.info("[SpawnerHunt] Found {} predicted dungeons within 8 chunks of {}, {}.",
+                    dungeons.size(), queryX, queryZ);
 
-                if (!mc.level.hasChunk(chunkX, chunkZ)) continue;
+                for (PredictedDungeon dungeon : dungeons) {
+                    MeteorClient.LOG.info("[SpawnerHunt] {} dungeon at {}, {}, {} (chunk {}, {}).",
+                        dungeon.mob(), dungeon.x(), dungeon.y(), dungeon.z(), dungeon.chunkX(), dungeon.chunkZ());
+                }
 
-                // 1. Initialize Modern Feature Seed
-                random.setFeatureSeed(seed, featureIdx, net.minecraft.world.level.levelgen.GenerationStep.Decoration.UNDERGROUND_STRUCTURES.ordinal());
+                // Preserve the existing packet method, but now use the actual
+                // dungeon locations returned by BO7jce9YHoxA.js + WASM instead
+                // of the old hand-reimplemented world-generation attempt.
+                if (DungeonPacketmethod.get() && mc.player != null) {
+                    for (PredictedDungeon dungeon : dungeons) {
+                        BlockPos pos = new BlockPos(dungeon.x(), dungeon.y(), dungeon.z());
+                        if (packetedDungeons.contains(pos)) continue;
 
-                // 2. Loop 8 Attempts
-                // 2. Loop 8 Attempts
-                for (int attempt = 0; attempt < 8; attempt++) {
-                    // EXACT PRNG Call Order from wasm decompilation
-                    int localX = random.nextInt(16);
-                    int y = random.nextInt(114) - 64; // nextInt(114) - 64 covers Y=-64 to Y=49 (1.21 height bounds)
-                    int localZ = random.nextInt(16);
-                    int sizeX = random.nextInt(2) + 2;
-                    int sizeZ = random.nextInt(2) + 2;
+                        double distSq = mc.player.distanceToSqr(
+                            dungeon.x() + 0.5,
+                            dungeon.y() + 1.5,
+                            dungeon.z() + 0.5
+                        );
 
-                    int absoluteX = (chunkX << 4) + localX;
-                    int absoluteZ = (chunkZ << 4) + localZ;
-
-                    BlockPos attemptPos = new BlockPos(absoluteX, y, absoluteZ);
-
-                    // Check if we have already spoofed our location to this specific attempt
-                    if (!packetedDungeons.contains(attemptPos)) {
-
-                        // --- THE DISTANCE GATE (Restored) ---
-                        // Calculate the squared distance from the player to the attempt
-                        double distSq = mc.player.distanceToSqr(absoluteX + 0.5, y + 1.5, absoluteZ + 0.5);
-                        double safeDistanceSq = 32.0 * 32.0; // 32 block trigger radius
-
-                        // Only send the packet if the player is physically close enough
-                        if (distSq <= safeDistanceSq) {
-                            packetedDungeons.add(attemptPos);
-                            SendDungeonPacket(absoluteX + 0.5, y + 1.5, absoluteZ + 0.5);
+                        if (distSq <= 32.0 * 32.0) {
+                            packetedDungeons.add(pos);
+                            SendDungeonPacket(
+                                dungeon.x() + 0.5,
+                                dungeon.y() + 1.5,
+                                dungeon.z() + 0.5
+                            );
                         }
                     }
                 }
-            }
+            }));
+    }
+
+    private int resolveWorkerJavaVersion() {
+        String version = SharedConstants.getCurrentVersion().id();
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+            .compile("^(\\d+)\\.(\\d+)")
+            .matcher(version);
+
+        if (!matcher.find()) {
+            throw new IllegalStateException("Unable to determine Minecraft version from: " + version);
         }
+
+        int major = Integer.parseInt(matcher.group(1));
+        int minor = Integer.parseInt(matcher.group(2));
+        int workerVersion = major * 10000 + minor * 100;
+
+        if (workerVersion != 260100 && workerVersion != 260200 && workerVersion != 260300) {
+            throw new IllegalStateException(
+                "Bundled dungeon worker supports Java 26.1, 26.2 and 26.3, but Minecraft is " + version
+            );
+        }
+
+        return workerVersion;
     }
 
     private void SendDungeonPacket(double x, double y, double z) {
@@ -988,7 +1045,7 @@ public class SpawnerHunt extends Module {
 
     @EventHandler
     private void onRender3d(Render3DEvent event) {
-        if (mc.level == null || mc.player == null || matchingSpawners.isEmpty() || RenderUtils.center == null) return;
+        if (mc.level == null || mc.player == null || (matchingSpawners.isEmpty() && predictedDungeons.isEmpty()) || RenderUtils.center == null) return;
 
         for (BlockPos pos : matchingSpawners) {
             if (box.get()) {
@@ -1003,5 +1060,253 @@ public class SpawnerHunt extends Module {
                 event.renderer.line(RenderUtils.center.x, RenderUtils.center.y, RenderUtils.center.z, x, y, z, tracerColor.get());
             }
         }
+
+        // Render predicted dungeon positions as thin target markers.
+        // Actual spawners remain the authoritative targets for mining/pathing.
+        for (PredictedDungeon dungeon : predictedDungeons) {
+            BlockPos pos = new BlockPos(dungeon.x(), dungeon.y(), dungeon.z());
+            event.renderer.box(pos, boxColor.get(), boxColor.get(), ShapeMode.Lines, 0);
+
+            if (tracers.get()) {
+                double x = dungeon.x() + 0.5;
+                double y = dungeon.y() + 0.5;
+                double z = dungeon.z() + 0.5;
+                event.renderer.line(RenderUtils.center.x, RenderUtils.center.y, RenderUtils.center.z, x, y, z, tracerColor.get());
+            }
+        }
     }
+    private record PredictedDungeon(int x, int y, int z, String mob, int chunkX, int chunkZ) {
+    }
+
+    /**
+     * JVM bridge for the supplied Chunkbase worker. This runs the original
+     * JavaScript and WASM locally; it does not reimplement Minecraft terrain
+     * or dungeon generation in Java.
+     *
+     * Required resources:
+     *   /dungeon/BO7jce9YHoxA.js
+     *   /dungeon/C4q1boG87vQ4.simd.wasm
+     */
+    private static final class ChunkbaseDungeonFinder implements AutoCloseable {
+        private static final String WORKER_RESOURCE = "/dungeon/BO7jce9YHoxA.js";
+        private static final String WASM_RESOURCE = "/dungeon/C4q1boG87vQ4.simd.wasm";
+        private static final int RADIUS_CHUNKS = 8;
+
+        private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
+            Thread thread = new Thread(r, "SpawnerHunt-DungeonFinder");
+            thread.setDaemon(true);
+            return thread;
+        });
+
+        private final CompletableFuture<Void> initialization;
+        private Context context;
+        private Value findDungeonsFunction;
+
+        ChunkbaseDungeonFinder() {
+            initialization = CompletableFuture.runAsync(this::initialize, executor);
+        }
+
+        CompletableFuture<List<PredictedDungeon>> findDungeons(long seed, int javaVersion, int blockX, int blockZ) {
+            CompletableFuture<List<PredictedDungeon>> result = new CompletableFuture<>();
+
+            initialization.whenComplete((ignored, initError) -> {
+                if (initError != null) {
+                    result.completeExceptionally(initError);
+                    return;
+                }
+
+                executor.execute(() -> {
+                    synchronized (ChunkbaseDungeonFinder.this) {
+                        try {
+                            Value promise = findDungeonsFunction.execute(
+                                Long.toString(seed),
+                                javaVersion,
+                                blockX,
+                                blockZ
+                            );
+
+                            // getPois() is asynchronous in the original worker.
+                            // Register a JS Promise callback and complete the Java
+                            // future when the original worker resolves.
+                            promise.invokeMember(
+                                "then",
+                                (ProxyExecutable) arguments -> {
+                                    try {
+                                        result.complete(decodeResults(arguments[0]));
+                                    } catch (Throwable throwable) {
+                                        result.completeExceptionally(throwable);
+                                    }
+                                    return null;
+                                },
+                                (ProxyExecutable) arguments -> {
+                                    result.completeExceptionally(
+                                        new RuntimeException(arguments[0].toString())
+                                    );
+                                    return null;
+                                }
+                            );
+                        } catch (Throwable throwable) {
+                            result.completeExceptionally(throwable);
+                        }
+                    }
+                });
+            });
+
+            return result;
+        }
+
+        private void initialize() {
+            try {
+                byte[] wasm = readResourceBytes(WASM_RESOURCE);
+                String worker = readResourceText(WORKER_RESOURCE);
+
+                // The original worker is browser-oriented. We keep its actual
+                // generation logic but replace only the browser bootstrap pieces:
+                //   - WASM URL -> in-memory ArrayBuffer
+                //   - self -> minimal object
+                //   - Comlink endpoint export -> direct API export
+                worker = patchWorker(worker, wasm);
+
+                context = Context.newBuilder("js")
+                    .allowAllAccess(true)
+                    .allowExperimentalOptions(true)
+                    .option("js.webassembly", "true")
+                    .build();
+
+                String bootstrap = """
+                    globalThis.self = globalThis.self || { addEventListener() {}, removeEventListener() {} };
+
+                    %s
+
+                    globalThis.__findDungeons = async function(seed, javaVersion, x, z) {
+                        const world = {
+                            edition: "Java",
+                            seed: String(seed),
+                            javaVersion: javaVersion,
+                            config: {
+                                flat: false,
+                                biomeSize: null,
+                                largeBiomes: false
+                            }
+                        };
+
+                        const centerChunkX = Math.floor(x / 16);
+                        const centerChunkZ = Math.floor(z / 16);
+                        const startChunkX = centerChunkX - 8;
+                        const startChunkZ = centerChunkZ - 8;
+
+                        const raw = await globalThis.__chunkbaseApi.getPois(
+                            world,
+                            ["dungeon"],
+                            startChunkX,
+                            startChunkZ,
+                            17,
+                            17
+                        );
+
+                        const names = { 0: "Zombie", 1: "Spider", 2: "Skeleton" };
+                        const output = [];
+
+                        for (const item of (raw?.dungeon ?? [])) {
+                            const chunkX = item[0];
+                            const chunkZ = item[1];
+                            for (const entry of (item[2] ?? [])) {
+                                if (!Array.isArray(entry) || entry.length < 4) continue;
+                                output.push({
+                                    x: entry[0],
+                                    y: entry[1],
+                                    z: entry[2],
+                                    mob: names[entry[3]] ?? ("Unknown (" + entry[3] + ")"),
+                                    chunkX,
+                                    chunkZ
+                                });
+                            }
+                        }
+
+                        return output;
+                    };
+                """.formatted(worker);
+
+                context.eval(Source.newBuilder("js", bootstrap, "spawner-hunt-bootstrap.js").build());
+                findDungeonsFunction = context.getBindings("js").getMember("__findDungeons");
+            } catch (Throwable throwable) {
+                throw new RuntimeException("Failed to initialise Chunkbase dungeon finder", throwable);
+            }
+        }
+
+        private static String patchWorker(String worker, byte[] wasm) {
+            String wasmBase64 = Base64.getEncoder().encodeToString(wasm);
+            String replacement = "var oc = globalThis.__dungeonWasm, Ss = globalThis.__dungeonWasm;";
+
+            worker = worker.replace(
+                "var oc = \"/_astro/C4q1boG87vQ4.simd.wasm\",\n  Ss = \"/_astro/BIhsZSp9IFGv.wasm\";",
+                replacement
+            );
+
+            // Minified/prettified variants may place these declarations on one line.
+            worker = worker.replace(
+                "var oc = \"/_astro/C4q1boG87vQ4.simd.wasm\", Ss = \"/_astro/BIhsZSp9IFGv.wasm\";",
+                replacement
+            );
+
+            worker = worker.replace("li(wg);", "globalThis.__chunkbaseApi = wg;");
+
+            // The original browser worker periodically yields through MessageChannel.
+            // GraalJS does not provide the browser MessageChannel global, so replace
+            // that yield helper with an already-resolved Promise. This does not alter
+            // the dungeon-generation algorithm; it only removes the browser scheduler dependency.
+            worker = worker.replace(
+                "function hc() {\n  return new Promise((e) => {\n    const { port1: t, port2: n } = new MessageChannel();\n    ((t.onmessage = () => {\n      (t.close(), e());\n    }),\n      n.postMessage(null));\n  });\n}",
+                "function hc() { return Promise.resolve(); }"
+            );
+
+            String prefix = """
+                globalThis.__dungeonWasm = (() => {
+                    const bytes = Java.type(\"java.util.Base64\").getDecoder().decode(\"%s\");
+                    return new Uint8Array(Java.from(bytes)).buffer;
+                })();
+
+                globalThis.self = globalThis.self || { addEventListener() {}, removeEventListener() {} };
+                """.formatted(wasmBase64);
+
+            return prefix + worker;
+        }
+
+        private static List<PredictedDungeon> decodeResults(Value array) {
+            List<PredictedDungeon> result = new ArrayList<>();
+            long size = array.getArraySize();
+
+            for (long i = 0; i < size; i++) {
+                Value value = array.getArrayElement(i);
+                result.add(new PredictedDungeon(
+                    value.getMember("x").asInt(),
+                    value.getMember("y").asInt(),
+                    value.getMember("z").asInt(),
+                    value.getMember("mob").asString(),
+                    value.getMember("chunkX").asInt(),
+                    value.getMember("chunkZ").asInt()
+                ));
+            }
+
+            return result;
+        }
+
+        private static byte[] readResourceBytes(String path) throws IOException {
+            try (InputStream stream = ChunkbaseDungeonFinder.class.getResourceAsStream(path)) {
+                if (stream == null) throw new IOException("Missing resource: " + path);
+                return stream.readAllBytes();
+            }
+        }
+
+        private static String readResourceText(String path) throws IOException {
+            return new String(readResourceBytes(path), StandardCharsets.UTF_8);
+        }
+
+        @Override
+        public void close() {
+            executor.shutdownNow();
+            if (context != null) context.close();
+        }
+    }
+
 }

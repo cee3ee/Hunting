@@ -25,7 +25,9 @@ dependencies {
     // Fabric
     minecraft(libs.minecraft)
     implementation(libs.fabric.loader)
-
+    // Source: https://mvnrepository.com/artifact/org.graalvm.js/js
+    // GraalJS
+    implementation("org.graalvm.js:js:25.3.4.1")
     // Meteor
     implementation(libs.meteor.client)
 }

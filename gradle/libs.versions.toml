@@ -13,6 +13,10 @@ loom = "1.16-SNAPSHOT"
 # Meteor (https://github.com/MeteorDevelopment/meteor-client/)
 meteor = "26.1.2-SNAPSHOT"
 
+# Graal
+
+graalVersion = "25.3.4.1"
+
 # Mods
 
 [libraries]
