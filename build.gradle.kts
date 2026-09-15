@@ -7,34 +7,51 @@ base {
     version = libs.versions.mod.version.get()
     group = properties["maven_group"] as String
 }
+
 loom {
     accessWidenerPath.set(file("src/main/resources/hunters.accesswidener"))
 }
+
 repositories {
+    mavenCentral()
+
     maven {
         name = "meteor-maven"
         url = uri("https://maven.meteordev.org/releases")
     }
+
     maven {
         name = "meteor-maven-snapshots"
         url = uri("https://maven.meteordev.org/snapshots")
     }
 }
 
+/*
+ * Deliberately keep Graal off implementation/compileOnly.
+ * Fabric Loom 1.16.3 attempts to process dependencies in those
+ * configurations and currently trips over the Graal dependency tree.
+ */
+val graalCompile by configurations.creating
+
 dependencies {
     // Fabric
     minecraft(libs.minecraft)
     implementation(libs.fabric.loader)
-    // Source: https://mvnrepository.com/artifact/org.graalvm.js/js
-    // GraalJS
-    implementation("org.graalvm.js:js:25.3.4.1")
+
     // Meteor
     implementation(libs.meteor.client)
+
+    // GraalVM -- custom configuration, not processed by Loom
+    graalCompile("org.graalvm.polyglot:polyglot:25.3.4.1")
+    graalCompile("org.graalvm.polyglot:js:25.3.4.1")
+    graalCompile("org.graalvm.polyglot:wasm:25.3.4.1")
 }
 
 java {
     toolchain {
-        languageVersion.set(JavaLanguageVersion.of(libs.versions.jdk.get().toInt()))
+        languageVersion.set(
+            JavaLanguageVersion.of(libs.versions.jdk.get().toInt())
+        )
     }
 }
 
@@ -48,6 +65,21 @@ fun toMinecraftCompat(version: String): String {
 }
 
 tasks {
+    /*
+     * Give javac access to Graal without exposing the configuration
+     * to Loom's dependency processing.
+     */
+    withType<JavaCompile>().configureEach {
+        classpath = classpath.plus(graalCompile)
+
+        options.compilerArgs.addAll(
+            listOf(
+                "-Xlint:deprecation",
+                "-Xlint:unchecked"
+            )
+        )
+    }
+
     processResources {
         val propertyMap = mapOf(
             "version" to project.version,
@@ -56,6 +88,7 @@ tasks {
         )
 
         inputs.properties(propertyMap)
+
         filesMatching("fabric.mod.json") {
             expand(propertyMap)
         }
@@ -67,14 +100,5 @@ tasks {
         from("LICENSE") {
             rename { "${it}_${inputs.properties["archivesName"]}" }
         }
-    }
-
-    withType<JavaCompile>().configureEach {
-        options.compilerArgs.addAll(
-            listOf(
-                "-Xlint:deprecation",
-                "-Xlint:unchecked"
-            )
-        )
     }
 }
