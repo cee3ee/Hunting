@@ -585,6 +585,11 @@ public class SpawnerHunt extends Module {
         int queryX = mc.player.getBlockX();
         int queryZ = mc.player.getBlockZ();
 
+        MeteorClient.LOG.info(
+            "[SpawnerHunt] Dungeon scan request: seed={}, javaVersion={}, block=({}, {}), centerChunk=({}, {}), radius=8, size=17x17.",
+            seed, javaVersion, queryX, queryZ, centerChunkX, centerChunkZ
+        );
+
         dungeonFinder.findDungeons(seed, javaVersion, queryX, queryZ)
             .whenComplete((dungeons, throwable) -> mc.execute(() -> {
                 if (throwable != null) {
@@ -1255,12 +1260,20 @@ public class SpawnerHunt extends Module {
                         const centerChunkX = Math.floor(x / 16);
                         const centerChunkZ = Math.floor(z / 16);
 
-                        // TEMPORARY DEBUG SCAN: 1x1 chunk. Restore radius 8 after
-                        // the async worker path is proven to complete.
-                        const debugRadiusChunks = 0;
-                        const startChunkX = centerChunkX - debugRadiusChunks;
-                        const startChunkZ = centerChunkZ - debugRadiusChunks;
-                        const scanSize = debugRadiusChunks * 2 + 1;
+                        // Full scan: 8 chunks in each direction from the
+                        // player's current chunk, giving a 17x17 chunk area.
+                        const radiusChunks = 8;
+                        const startChunkX = centerChunkX - radiusChunks;
+                        const startChunkZ = centerChunkZ - radiusChunks;
+                        const scanSize = radiusChunks * 2 + 1;
+
+                        console.log(
+                            "[SpawnerHunt] Chunkbase query: seed=" + String(seed) +
+                            ", javaVersion=" + javaVersion +
+                            ", centerChunk=(" + centerChunkX + ", " + centerChunkZ + ")" +
+                            ", startChunk=(" + startChunkX + ", " + startChunkZ + ")" +
+                            ", size=" + scanSize + "x" + scanSize
+                        );
 
                         // The original Chunkbase worker initializes its WASM module
                         // through initWorker() before any API method is used.
@@ -1278,16 +1291,28 @@ public class SpawnerHunt extends Module {
                         );
 
                         console.log("[SpawnerHunt] Chunkbase getPois completed in " + (Date.now() - startedAt) + " ms");
+                        console.log("[SpawnerHunt] Chunkbase raw result: " + JSON.stringify(raw));
+
+                        const dungeonChunks = raw?.dungeon ?? [];
+                        if (!Array.isArray(dungeonChunks)) {
+                            throw new TypeError(
+                                "Chunkbase getPois returned an unexpected dungeon payload: " +
+                                JSON.stringify(raw)
+                            );
+                        }
+
+                        console.log(
+                            "[SpawnerHunt] Chunkbase dungeon chunk groups returned: " + dungeonChunks.length
+                        );
 
                         const names = { 0: "Zombie", 1: "Spider", 2: "Skeleton" };
                         const output = [];
 
-                        for (const item of (raw ?? [])) {
+                        for (const item of dungeonChunks) {
                             const chunkX = item[0];
                             const chunkZ = item[1];
                             for (const entry of (item[2] ?? [])) {
                                 if (!Array.isArray(entry) || entry.length < 4) continue;
-
                                 output.push({
                                     x: entry[0],
                                     y: entry[1],
