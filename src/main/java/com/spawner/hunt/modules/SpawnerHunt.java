@@ -46,6 +46,8 @@ import java.util.Base64;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 // Requires GraalJS Polyglot + JS runtime dependencies in build.gradle.
 
@@ -53,6 +55,7 @@ import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.proxy.ProxyExecutable;
+import org.graalvm.polyglot.PolyglotAccess;
 
 public class SpawnerHunt extends Module {
     private static final int PICKUP_TIMEOUT_TICKS = 200;
@@ -315,16 +318,18 @@ public class SpawnerHunt extends Module {
             return;
         }
 
-        if (DungeonPacketmethod.get()) {
-            int playerChunkX = Math.floorDiv(mc.player.getBlockX(), 16);
-            int playerChunkZ = Math.floorDiv(mc.player.getBlockZ(), 16);
-            String seed = worldSeed.get().trim();
-            if (mc.player.tickCount % 20 == 0
-                && (playerChunkX != lastDungeonScanChunkX
-                || playerChunkZ != lastDungeonScanChunkZ
-                || !seed.equals(lastDungeonScanSeed))) {
-                ScanDungeonAttempts();
-            }
+        int playerChunkX = Math.floorDiv(mc.player.getBlockX(), 16);
+        int playerChunkZ = Math.floorDiv(mc.player.getBlockZ(), 16);
+        String seed = worldSeed.get().trim();
+
+        // Prediction runs independently of the optional packet method.
+        // The scanner itself also updates the last-scan state, while the
+        // worker is invoked only when the player chunk or seed changes.
+        if (mc.player.tickCount % 20 == 0
+            && (playerChunkX != lastDungeonScanChunkX
+            || playerChunkZ != lastDungeonScanChunkZ
+            || !seed.equals(lastDungeonScanSeed))) {
+            ScanDungeonAttempts();
         }
 
         if (rtpCooldown > 0) rtpCooldown--;
@@ -1089,11 +1094,21 @@ public class SpawnerHunt extends Module {
      */
     private static final class ChunkbaseDungeonFinder implements AutoCloseable {
         private static final String WORKER_RESOURCE = "/dungeon/BO7jce9YHoxA.js";
-        private static final String WASM_RESOURCE = "/dungeon/C4q1boG87vQ4.simd.wasm";
+        private static final String WASM_SIMD_RESOURCE = "/dungeon/C4q1boG87vQ4.simd.wasm";
+        private static final String WASM_FALLBACK_RESOURCE = "/dungeon/BIhsZSp9IFGv.wasm";
         private static final int RADIUS_CHUNKS = 8;
 
         private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
             Thread thread = new Thread(r, "SpawnerHunt-DungeonFinder");
+            thread.setDaemon(true);
+            return thread;
+        });
+
+        // GraalJS does not provide the browser MessageChannel used by the
+        // original worker. This scheduler is used to reproduce its
+        // macrotask-style yield without re-entering JS concurrently.
+        private final ScheduledExecutorService yieldExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread thread = new Thread(r, "SpawnerHunt-JsYield");
             thread.setDaemon(true);
             return thread;
         });
@@ -1139,8 +1154,38 @@ public class SpawnerHunt extends Module {
                                     return null;
                                 },
                                 (ProxyExecutable) arguments -> {
+                                    String message = "Unknown JavaScript error";
+                                    String stack = "<no JavaScript stack available>";
+
+                                    if (arguments.length > 0 && arguments[0] != null) {
+                                        Value error = arguments[0];
+
+                                        try {
+                                            Value messageValue = error.getMember("message");
+                                            if (messageValue != null && messageValue.isString()) {
+                                                message = messageValue.asString();
+                                            } else {
+                                                message = error.toString();
+                                            }
+                                        } catch (Throwable messageReadError) {
+                                            message = error.toString();
+                                        }
+
+                                        try {
+                                            Value stackValue = error.getMember("stack");
+                                            if (stackValue != null && stackValue.isString()) {
+                                                stack = stackValue.asString();
+                                            }
+                                        } catch (Throwable stackReadError) {
+                                            // Keep the fallback stack message.
+                                        }
+                                    }
+
                                     result.completeExceptionally(
-                                        new RuntimeException(arguments[0].toString())
+                                        new RuntimeException(
+                                            "Chunkbase worker rejected: " + message
+                                                + "\nJavaScript stack:\n" + stack
+                                        )
                                     );
                                     return null;
                                 }
@@ -1157,21 +1202,36 @@ public class SpawnerHunt extends Module {
 
         private void initialize() {
             try {
-                byte[] wasm = readResourceBytes(WASM_RESOURCE);
+                byte[] wasmSimd = readResourceBytes(WASM_SIMD_RESOURCE);
+                byte[] wasmFallback = readResourceBytes(WASM_FALLBACK_RESOURCE);
                 String worker = readResourceText(WORKER_RESOURCE);
 
                 // The original worker is browser-oriented. We keep its actual
                 // generation logic but replace only the browser bootstrap pieces:
-                //   - WASM URL -> in-memory ArrayBuffer
+                //   - SIMD WASM URL -> in-memory ArrayBuffer
+                //   - fallback WASM URL -> in-memory ArrayBuffer
                 //   - self -> minimal object
                 //   - Comlink endpoint export -> direct API export
-                worker = patchWorker(worker, wasm);
+                worker = patchWorker(worker, wasmSimd, wasmFallback);
 
-                context = Context.newBuilder("js")
+                context = Context.newBuilder("js", "wasm")
                     .allowAllAccess(true)
+                    .allowPolyglotAccess(PolyglotAccess.ALL)
                     .allowExperimentalOptions(true)
                     .option("js.webassembly", "true")
                     .build();
+
+                // Expose a host-side scheduler before the worker is evaluated. The
+                // patched hc() helper calls this with the Promise resolver.
+                context.getBindings("js").putMember(
+                    "__spawnHuntScheduleYield",
+                    (ProxyExecutable) arguments -> {
+                        if (arguments.length > 0 && arguments[0] != null) {
+                            scheduleJsResume(arguments[0]);
+                        }
+                        return null;
+                    }
+                );
 
                 String bootstrap = """
                     globalThis.self = globalThis.self || { addEventListener() {}, removeEventListener() {} };
@@ -1179,6 +1239,8 @@ public class SpawnerHunt extends Module {
                     %s
 
                     globalThis.__findDungeons = async function(seed, javaVersion, x, z) {
+                        const startedAt = Date.now();
+                        console.log("[SpawnerHunt] Chunkbase scan started");
                         const world = {
                             edition: "Java",
                             seed: String(seed),
@@ -1192,26 +1254,40 @@ public class SpawnerHunt extends Module {
 
                         const centerChunkX = Math.floor(x / 16);
                         const centerChunkZ = Math.floor(z / 16);
-                        const startChunkX = centerChunkX - 8;
-                        const startChunkZ = centerChunkZ - 8;
+
+                        // TEMPORARY DEBUG SCAN: 1x1 chunk. Restore radius 8 after
+                        // the async worker path is proven to complete.
+                        const debugRadiusChunks = 0;
+                        const startChunkX = centerChunkX - debugRadiusChunks;
+                        const startChunkZ = centerChunkZ - debugRadiusChunks;
+                        const scanSize = debugRadiusChunks * 2 + 1;
+
+                        // The original Chunkbase worker initializes its WASM module
+                        // through initWorker() before any API method is used.
+                        // Our direct Java bridge bypasses the browser message handler,
+                        // so perform that initialization explicitly here.
+                        await globalThis.__chunkbaseApi.initWorker();
 
                         const raw = await globalThis.__chunkbaseApi.getPois(
                             world,
                             ["dungeon"],
                             startChunkX,
                             startChunkZ,
-                            17,
-                            17
+                            scanSize,
+                            scanSize
                         );
+
+                        console.log("[SpawnerHunt] Chunkbase getPois completed in " + (Date.now() - startedAt) + " ms");
 
                         const names = { 0: "Zombie", 1: "Spider", 2: "Skeleton" };
                         const output = [];
 
-                        for (const item of (raw?.dungeon ?? [])) {
+                        for (const item of (raw ?? [])) {
                             const chunkX = item[0];
                             const chunkZ = item[1];
                             for (const entry of (item[2] ?? [])) {
                                 if (!Array.isArray(entry) || entry.length < 4) continue;
+
                                 output.push({
                                     x: entry[0],
                                     y: entry[1],
@@ -1234,9 +1310,17 @@ public class SpawnerHunt extends Module {
             }
         }
 
-        private static String patchWorker(String worker, byte[] wasm) {
-            String wasmBase64 = Base64.getEncoder().encodeToString(wasm);
-            String replacement = "var oc = globalThis.__dungeonWasm, Ss = globalThis.__dungeonWasm;";
+        private static String patchWorker(String worker, byte[] wasmSimd, byte[] wasmFallback) {
+            String wasmSimdBase64 = Base64.getEncoder().encodeToString(wasmSimd);
+            String wasmFallbackBase64 = Base64.getEncoder().encodeToString(wasmFallback);
+
+            // Chunkbase deliberately ships two WASM builds:
+            //   oc -> SIMD build
+            //   Ss -> non-SIMD fallback build
+            //
+            // Keep these separate because the worker selects between them based
+            // on WASM SIMD support.
+            String replacement = "var oc = globalThis.__dungeonWasmSimd, Ss = globalThis.__dungeonWasmFallback;";
 
             worker = worker.replace(
                 "var oc = \"/_astro/C4q1boG87vQ4.simd.wasm\",\n  Ss = \"/_astro/BIhsZSp9IFGv.wasm\";",
@@ -1252,24 +1336,106 @@ public class SpawnerHunt extends Module {
             worker = worker.replace("li(wg);", "globalThis.__chunkbaseApi = wg;");
 
             // The original browser worker periodically yields through MessageChannel.
-            // GraalJS does not provide the browser MessageChannel global, so replace
-            // that yield helper with an already-resolved Promise. This does not alter
-            // the dungeon-generation algorithm; it only removes the browser scheduler dependency.
+            // GraalJS has no browser MessageChannel, and Promise.resolve() is too weak
+            // because it only creates a microtask continuation. Use a host-side scheduled
+            // callback to emulate a real macrotask boundary.
             worker = worker.replace(
                 "function hc() {\n  return new Promise((e) => {\n    const { port1: t, port2: n } = new MessageChannel();\n    ((t.onmessage = () => {\n      (t.close(), e());\n    }),\n      n.postMessage(null));\n  });\n}",
-                "function hc() { return Promise.resolve(); }"
+                "function hc() { return new Promise((resolve) => globalThis.__spawnHuntScheduleYield(resolve)); }"
             );
 
             String prefix = """
-                globalThis.__dungeonWasm = (() => {
-                    const bytes = Java.type(\"java.util.Base64\").getDecoder().decode(\"%s\");
+                globalThis.TextDecoder = class TextDecoder {
+                    constructor(label = "utf-8", options = {}) {
+                        this.encoding = String(label).toLowerCase();
+                        this.fatal = Boolean(options.fatal);
+                        this.ignoreBOM = Boolean(options.ignoreBOM);
+
+                        if (this.encoding !== "utf-8" && this.encoding !== "utf8") {
+                            throw new Error("SpawnerHunt TextDecoder only supports UTF-8");
+                        }
+                    }
+
+                    decode(input = new Uint8Array(), options = {}) {
+                        let bytes;
+
+                        if (input instanceof ArrayBuffer) {
+                            bytes = new Uint8Array(input);
+                        } else if (ArrayBuffer.isView(input)) {
+                            bytes = new Uint8Array(
+                                input.buffer,
+                                input.byteOffset,
+                                input.byteLength
+                            );
+                        } else {
+                            bytes = new Uint8Array(input);
+                        }
+
+                        const javaBytes = Java.to(Array.from(bytes), "byte[]");
+                        const StringClass = Java.type("java.lang.String");
+                        const StandardCharsets = Java.type("java.nio.charset.StandardCharsets");
+
+                        return new StringClass(
+                            javaBytes,
+                            StandardCharsets.UTF_8
+                        );
+                    }
+                };
+
+                globalThis.TextEncoder = class TextEncoder {
+                    constructor() {
+                        this.encoding = "utf-8";
+                    }
+
+                    encode(input = "") {
+                        const StringClass = Java.type("java.lang.String");
+                        const StandardCharsets = Java.type("java.nio.charset.StandardCharsets");
+
+                        const bytes = new StringClass(
+                            String(input)
+                        ).getBytes(StandardCharsets.UTF_8);
+
+                        return new Uint8Array(Java.from(bytes));
+                    }
+                };
+
+                globalThis.__dungeonWasmSimd = (() => {
+                    const bytes = Java.type("java.util.Base64").getDecoder().decode("%s");
                     return new Uint8Array(Java.from(bytes)).buffer;
                 })();
 
-                globalThis.self = globalThis.self || { addEventListener() {}, removeEventListener() {} };
-                """.formatted(wasmBase64);
+                globalThis.__dungeonWasmFallback = (() => {
+                    const bytes = Java.type("java.util.Base64").getDecoder().decode("%s");
+                    return new Uint8Array(Java.from(bytes)).buffer;
+                })();
+
+                globalThis.self = globalThis.self || {
+                    addEventListener() {},
+                    removeEventListener() {}
+                };
+                """.formatted(wasmSimdBase64, wasmFallbackBase64);
 
             return prefix + worker;
+        }
+
+        private void scheduleJsResume(Value resolver) {
+            yieldExecutor.schedule(() -> {
+                synchronized (ChunkbaseDungeonFinder.this) {
+                    if (context == null) return;
+
+                    context.enter();
+                    try {
+                        resolver.executeVoid();
+                        // Entering/evaluating the context gives GraalJS a boundary at
+                        // which queued Promise jobs can be processed.
+                        context.eval("js", "0");
+                    } catch (Throwable throwable) {
+                        MeteorClient.LOG.error("[SpawnerHunt] JS yield callback failed", throwable);
+                    } finally {
+                        context.leave();
+                    }
+                }
+            }, 1, TimeUnit.MILLISECONDS);
         }
 
         private static List<PredictedDungeon> decodeResults(Value array) {
@@ -1304,6 +1470,7 @@ public class SpawnerHunt extends Module {
 
         @Override
         public void close() {
+            yieldExecutor.shutdownNow();
             executor.shutdownNow();
             if (context != null) context.close();
         }
