@@ -72,6 +72,20 @@ public class SpawnerHunt extends Module {
         TargetCoordinates
     }
 
+    /** Selects the source used to locate spawner targets. */
+    public enum DetectionMethod {
+        WorldScan,
+        ChunkbasePrediction,
+        DualVerification
+    }
+
+    private final Setting<DetectionMethod> detectionMethod = sgGeneral.add(new EnumSetting.Builder<DetectionMethod>()
+        .name("finder-method")
+        .description("Choose loaded-world scanning, Chunkbase seed prediction, or dual verification (predict then confirm in the loaded world).")
+        .defaultValue(DetectionMethod.WorldScan)
+        .build()
+    );
+
     private final Setting<List<String>> mobFilter = sgGeneral.add(new StringListSetting.Builder()
         .name("mob-filter")
         .description("Only targets spawners whose mob id exactly matches this value. Must be in format minecraft:mob-id")
@@ -243,7 +257,26 @@ public class SpawnerHunt extends Module {
         .build()
     );
 
+    private final Setting<Boolean> predictionBox = sgRender.add(new BoolSetting.Builder()
+        .name("prediction-box")
+        .description("Draws a box at each predicted coordinate (or dual-verified coordinate in Dual Verification mode).")
+        .defaultValue(true)
+        .visible(() -> detectionMethod.get() == DetectionMethod.ChunkbasePrediction
+            || detectionMethod.get() == DetectionMethod.DualVerification)
+        .build()
+    );
+
+    private final Setting<Boolean> predictionTracers = sgRender.add(new BoolSetting.Builder()
+        .name("prediction-tracers")
+        .description("Draws a tracer to each predicted coordinate (or dual-verified coordinate in Dual Verification mode).")
+        .defaultValue(true)
+        .visible(() -> detectionMethod.get() == DetectionMethod.ChunkbasePrediction
+            || detectionMethod.get() == DetectionMethod.DualVerification)
+        .build()
+    );
+
     private final List<BlockPos> matchingSpawners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final List<BlockPos> dualVerifiedSpawners = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final Map<BlockPos, String> fallbackEntityIdCache = new HashMap<>();
     private final Set<BlockPos> packetedDungeons = new HashSet<>(); // NEW: Prevents packet spam
 
@@ -276,9 +309,10 @@ public class SpawnerHunt extends Module {
         fallbackEntityIdCache.clear();
         packetedDungeons.clear();
         predictedDungeons.clear();
-        lastDungeonScanChunkX = Integer.MIN_VALUE;
-        lastDungeonScanChunkZ = Integer.MIN_VALUE;
-        lastDungeonScanSeed = null;
+        dualVerifiedSpawners.clear();
+        invalidPredictedTargets.clear();
+        clearDungeonScanState();
+        clearDungeonCache();
         currentTarget = null;
         clearExploration();
         clearPickupVerification();
@@ -318,18 +352,51 @@ public class SpawnerHunt extends Module {
             return;
         }
 
+        if (detectionMethod.get() != lastDetectionMethod) {
+            lastDetectionMethod = detectionMethod.get();
+            matchingSpawners.clear();
+            predictedDungeons.clear();
+            dualVerifiedSpawners.clear();
+            invalidPredictedTargets.clear();
+            currentTarget = null;
+            clearDungeonScanState();
+            stopOwnedPathing();
+        }
+
         int playerChunkX = Math.floorDiv(mc.player.getBlockX(), 16);
         int playerChunkZ = Math.floorDiv(mc.player.getBlockZ(), 16);
         String seed = worldSeed.get().trim();
 
-        // Prediction runs independently of the optional packet method.
-        // The scanner itself also updates the last-scan state, while the
-        // worker is invoked only when the player chunk or seed changes.
-        if (mc.player.tickCount % 20 == 0
-            && (playerChunkX != lastDungeonScanChunkX
-            || playerChunkZ != lastDungeonScanChunkZ
-            || !seed.equals(lastDungeonScanSeed))) {
-            ScanDungeonAttempts();
+        boolean usesPrediction = detectionMethod.get() == DetectionMethod.ChunkbasePrediction
+            || detectionMethod.get() == DetectionMethod.DualVerification;
+
+        if (usesPrediction) {
+            int radius = predictionRadius.get();
+
+            // Prediction runs in both Chunkbase and Dual Verification modes. While
+            // a scan is active, retain only the newest requested position/radius/seed.
+            if (mc.player.tickCount % 20 == 0) {
+                boolean requestedStateChanged = playerChunkX != activeDungeonScanChunkX
+                    || playerChunkZ != activeDungeonScanChunkZ
+                    || !seed.equals(activeDungeonScanSeed)
+                    || radius != activeDungeonScanRadius;
+
+                if (dungeonScanRunning) {
+                    if (requestedStateChanged) {
+                        pendingDungeonScan = true;
+                        pendingDungeonScanChunkX = playerChunkX;
+                        pendingDungeonScanChunkZ = playerChunkZ;
+                        pendingDungeonScanSeed = seed;
+                        pendingDungeonScanRadius = radius;
+                    }
+                } else if (requestedStateChanged) {
+                    requestDungeonScan(playerChunkX, playerChunkZ, seed, radius);
+                }
+            }
+        } else {
+            predictedDungeons.clear();
+            dualVerifiedSpawners.clear();
+            clearDungeonScanState();
         }
 
         if (rtpCooldown > 0) rtpCooldown--;
@@ -350,9 +417,21 @@ public class SpawnerHunt extends Module {
 
         spawnerScanCooldown++;
 
-        if (spawnerScanCooldown >= 10) {
+        if (detectionMethod.get() == DetectionMethod.WorldScan
+            || detectionMethod.get() == DetectionMethod.DualVerification) {
+            if (spawnerScanCooldown >= 10) {
+                spawnerScanCooldown = 0;
+                updateMatchingSpawners();
+                if (detectionMethod.get() == DetectionMethod.DualVerification) {
+                    updateDualVerifiedSpawners();
+                } else {
+                    dualVerifiedSpawners.clear();
+                }
+            }
+        } else {
+            matchingSpawners.clear();
+            dualVerifiedSpawners.clear();
             spawnerScanCooldown = 0;
-            updateMatchingSpawners();
         }
 
         if (waitingForTeleport && rtpStartPos != null) {
@@ -397,7 +476,9 @@ public class SpawnerHunt extends Module {
 
         warnedBaritoneUnavailable = false;
 
-        if (matchingSpawners.isEmpty() || findNearestSpawner() == null) {
+        BlockPos nearest = findNearestSpawner();
+
+        if (nearest == null) {
             currentTarget = null;
 
             if (returningBelowMaxY) {
@@ -437,10 +518,8 @@ public class SpawnerHunt extends Module {
 
         clearExploration();
 
-        BlockPos nearest = findNearestSpawner();
-
         if (currentTarget == null
-            || !matchingSpawners.contains(currentTarget)
+            || !isKnownTarget(currentTarget)
             || !mc.level.getWorldBorder().isWithinBounds(currentTarget)) {
             setCurrentTarget(nearest);
             pathToCurrentTarget();
@@ -457,7 +536,7 @@ public class SpawnerHunt extends Module {
         if (currentTarget != null && isWithinMineRange(currentTarget)) {
             stopOwnedPathing();
 
-            if (autoMine.get()) {
+            if (autoMine.get() && mc.level.getBlockState(currentTarget).is(Blocks.SPAWNER)) {
                 int beforeMineSpawnerCount = verifySpawnerPickup.get() ? countSpawnerItemsInInventory() : -1;
                 mineTargetSpawner(currentTarget);
 
@@ -548,91 +627,418 @@ public class SpawnerHunt extends Module {
         .name("world-seed")
         .description("The known 64-bit world seed used by the bundled dungeon finder.")
         .defaultValue("0")
+        .visible(() -> detectionMethod.get() == DetectionMethod.ChunkbasePrediction
+            || detectionMethod.get() == DetectionMethod.DualVerification)
+        .build()
+    );
+
+    private final Setting<Integer> predictionRadius = sgStealth.add(new IntSetting.Builder()
+        .name("prediction-radius")
+        .description("How many chunks to scan outward from the player's current chunk in each direction.")
+        .defaultValue(8)
+        .min(1)
+        .sliderRange(1, 16)
+        .visible(() -> detectionMethod.get() == DetectionMethod.ChunkbasePrediction
+            || detectionMethod.get() == DetectionMethod.DualVerification)
         .build()
     );
 
     /** Predicted dungeons returned by the bundled Chunkbase worker/WASM. */
     private final List<PredictedDungeon> predictedDungeons = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final Set<BlockPos> invalidPredictedTargets = new HashSet<>();
     private final ChunkbaseDungeonFinder dungeonFinder = new ChunkbaseDungeonFinder();
-    private int lastDungeonScanChunkX = Integer.MIN_VALUE;
-    private int lastDungeonScanChunkZ = Integer.MIN_VALUE;
-    private String lastDungeonScanSeed;
+    private DetectionMethod lastDetectionMethod = DetectionMethod.WorldScan;
+    private String activeDungeonScanSeed;
+    private int activeDungeonScanRadius = -1;
+    private int activeDungeonScanChunkX = Integer.MIN_VALUE;
+    private int activeDungeonScanChunkZ = Integer.MIN_VALUE;
+    private boolean dungeonScanRunning;
 
-    private void ScanDungeonAttempts() {
+    private boolean pendingDungeonScan;
+    private int pendingDungeonScanChunkX = Integer.MIN_VALUE;
+    private int pendingDungeonScanChunkZ = Integer.MIN_VALUE;
+    private String pendingDungeonScanSeed;
+    private int pendingDungeonScanRadius = -1;
+
+    // Exact per-chunk Chunkbase cache. A chunk is marked as scanned even when it
+    // contained no dungeon, so later overlapping radius scans do not regenerate it.
+    private final Map<ChunkKey, List<PredictedDungeon>> dungeonChunkCache = new HashMap<>();
+    private final Set<ChunkKey> scannedDungeonChunks = new HashSet<>();
+    private String dungeonCacheSeed;
+    private int dungeonCacheJavaVersion = -1;
+    private static final int MAX_CACHED_DUNGEON_CHUNKS = 100_000;
+
+    private record ChunkKey(int x, int z) {
+    }
+
+    private record DungeonScanArea(int startChunkX, int startChunkZ, int sizeX, int sizeZ) {
+        int endChunkX() { return startChunkX + sizeX - 1; }
+        int endChunkZ() { return startChunkZ + sizeZ - 1; }
+    }
+
+    private void clearDungeonCache() {
+        dungeonChunkCache.clear();
+        scannedDungeonChunks.clear();
+        dungeonCacheSeed = null;
+        dungeonCacheJavaVersion = -1;
+    }
+
+    private void ensureDungeonCache(String seed, int javaVersion) {
+        if (!seed.equals(dungeonCacheSeed) || javaVersion != dungeonCacheJavaVersion) {
+            clearDungeonCache();
+            dungeonCacheSeed = seed;
+            dungeonCacheJavaVersion = javaVersion;
+        }
+    }
+
+    private void trimDungeonCacheIfNeeded() {
+        if (scannedDungeonChunks.size() <= MAX_CACHED_DUNGEON_CHUNKS) return;
+
+        String preservedSeed = dungeonCacheSeed;
+        int preservedJavaVersion = dungeonCacheJavaVersion;
+        clearDungeonCache();
+        dungeonCacheSeed = preservedSeed;
+        dungeonCacheJavaVersion = preservedJavaVersion;
+
+        MeteorClient.LOG.info("[SpawnerHunt] Chunkbase dungeon cache exceeded {} chunks; cache cleared.", MAX_CACHED_DUNGEON_CHUNKS);
+    }
+
+    private void clearDungeonScanState() {
+        dungeonScanRunning = false;
+        pendingDungeonScan = false;
+        activeDungeonScanSeed = null;
+        activeDungeonScanRadius = -1;
+        activeDungeonScanChunkX = Integer.MIN_VALUE;
+        activeDungeonScanChunkZ = Integer.MIN_VALUE;
+        pendingDungeonScanSeed = null;
+        pendingDungeonScanRadius = -1;
+        pendingDungeonScanChunkX = Integer.MIN_VALUE;
+        pendingDungeonScanChunkZ = Integer.MIN_VALUE;
+    }
+
+    /**
+     * Starts the newest requested Chunkbase scan, or records it as the only
+     * pending request when another scan is already running. Older queued scans
+     * are intentionally never accumulated.
+     */
+    private void requestDungeonScan(int centerChunkX, int centerChunkZ, String seedText, int radius) {
         if (mc.level == null || mc.player == null) return;
 
-        String seedText = worldSeed.get().trim();
+        if (dungeonScanRunning) {
+            pendingDungeonScan = true;
+            pendingDungeonScanChunkX = centerChunkX;
+            pendingDungeonScanChunkZ = centerChunkZ;
+            pendingDungeonScanSeed = seedText;
+            pendingDungeonScanRadius = radius;
+
+            MeteorClient.LOG.debug(
+                "[SpawnerHunt] Dungeon scan already running; keeping newest pending request centerChunk=({}, {}), radius={}, seed={}",
+                centerChunkX, centerChunkZ, radius, seedText
+            );
+            return;
+        }
+
+        ScanDungeonAttempts(centerChunkX, centerChunkZ, seedText, radius);
+    }
+
+    private void ScanDungeonAttempts(int centerChunkX, int centerChunkZ, String seedText, int radius) {
+        if (mc.level == null || mc.player == null) return;
+
         if (seedText.isEmpty() || !seedText.matches("[-+]?\\d+")) {
             MeteorClient.LOG.warn("[SpawnerHunt] Invalid world seed: {}", seedText);
             return;
         }
 
+        if (radius < 1) radius = 1;
+        if (radius > 16) radius = 16;
+
+        final int requestedChunkX = centerChunkX;
+        final int requestedChunkZ = centerChunkZ;
+        final int requestedRadius = radius;
+        final String requestedSeed = seedText;
         final long seed;
+
         try {
-            seed = Long.parseLong(seedText);
+            seed = Long.parseLong(requestedSeed);
         } catch (NumberFormatException e) {
-            MeteorClient.LOG.warn("[SpawnerHunt] World seed is outside signed 64-bit range: {}", seedText);
+            MeteorClient.LOG.warn("[SpawnerHunt] World seed is outside signed 64-bit range: {}", requestedSeed);
             return;
         }
 
-        final int centerChunkX = Math.floorDiv(mc.player.getBlockX(), 16);
-        final int centerChunkZ = Math.floorDiv(mc.player.getBlockZ(), 16);
-        lastDungeonScanChunkX = centerChunkX;
-        lastDungeonScanChunkZ = centerChunkZ;
-        lastDungeonScanSeed = seedText;
+        final int javaVersion = resolveWorkerJavaVersion();
+        ensureDungeonCache(requestedSeed, javaVersion);
 
-        int javaVersion = resolveWorkerJavaVersion();
-        int queryX = mc.player.getBlockX();
-        int queryZ = mc.player.getBlockZ();
-
-        MeteorClient.LOG.info(
-            "[SpawnerHunt] Dungeon scan request: seed={}, javaVersion={}, block=({}, {}), centerChunk=({}, {}), radius=8, size=17x17.",
-            seed, javaVersion, queryX, queryZ, centerChunkX, centerChunkZ
+        final int startChunkX = requestedChunkX - requestedRadius;
+        final int startChunkZ = requestedChunkZ - requestedRadius;
+        final int scanSize = requestedRadius * 2 + 1;
+        final DungeonScanArea requestedArea = new DungeonScanArea(
+            startChunkX,
+            startChunkZ,
+            scanSize,
+            scanSize
         );
 
-        dungeonFinder.findDungeons(seed, javaVersion, queryX, queryZ)
-            .whenComplete((dungeons, throwable) -> mc.execute(() -> {
-                if (throwable != null) {
-                    MeteorClient.LOG.error("[SpawnerHunt] Dungeon finder failed", throwable);
-                    return;
+        dungeonScanRunning = false;
+        activeDungeonScanChunkX = requestedChunkX;
+        activeDungeonScanChunkZ = requestedChunkZ;
+        activeDungeonScanSeed = requestedSeed;
+        activeDungeonScanRadius = requestedRadius;
+
+        List<DungeonScanArea> missingAreas = buildMissingDungeonScanAreas(requestedArea);
+
+        if (missingAreas.isEmpty()) {
+            applyCachedDungeonResults(requestedArea);
+            MeteorClient.LOG.info(
+                "[SpawnerHunt] Dungeon cache hit for centerChunk=({}, {}), radius={}; no new Chunkbase calculation needed.",
+                requestedChunkX, requestedChunkZ, requestedRadius
+            );
+            return;
+        }
+
+        dungeonScanRunning = true;
+
+        MeteorClient.LOG.info(
+            "[SpawnerHunt] Dungeon scan request: seed={}, javaVersion={}, centerChunk=({}, {}), radius={}, size={}x{}, missingAreas={}",
+            seed, javaVersion, requestedChunkX, requestedChunkZ, requestedRadius, scanSize, scanSize, missingAreas.size()
+        );
+
+        runDungeonScanAreas(
+            seed,
+            javaVersion,
+            requestedSeed,
+            requestedArea,
+            missingAreas,
+            0
+        );
+    }
+
+    private List<DungeonScanArea> buildMissingDungeonScanAreas(DungeonScanArea requestedArea) {
+        int totalChunks = requestedArea.sizeX() * requestedArea.sizeZ();
+        int missingChunks = 0;
+
+        for (int z = requestedArea.startChunkZ(); z <= requestedArea.endChunkZ(); z++) {
+            for (int x = requestedArea.startChunkX(); x <= requestedArea.endChunkX(); x++) {
+                if (!scannedDungeonChunks.contains(new ChunkKey(x, z))) {
+                    missingChunks++;
+                }
+            }
+        }
+
+        if (missingChunks == 0) return List.of();
+        if (missingChunks == totalChunks) return List.of(requestedArea);
+
+        // Decompose the missing cells into horizontal runs. After moving one
+        // chunk, this normally becomes one narrow strip rather than another
+        // complete radius scan, avoiding repeated work on cached chunks.
+        List<DungeonScanArea> areas = new ArrayList<>();
+
+        for (int z = requestedArea.startChunkZ(); z <= requestedArea.endChunkZ(); z++) {
+            int runStartX = Integer.MIN_VALUE;
+
+            for (int x = requestedArea.startChunkX(); x <= requestedArea.endChunkX(); x++) {
+                boolean missing = !scannedDungeonChunks.contains(new ChunkKey(x, z));
+
+                if (missing && runStartX == Integer.MIN_VALUE) {
+                    runStartX = x;
+                } else if (!missing && runStartX != Integer.MIN_VALUE) {
+                    areas.add(new DungeonScanArea(
+                        runStartX,
+                        z,
+                        x - runStartX,
+                        1
+                    ));
+                    runStartX = Integer.MIN_VALUE;
+                }
+            }
+
+            if (runStartX != Integer.MIN_VALUE) {
+                areas.add(new DungeonScanArea(
+                    runStartX,
+                    z,
+                    requestedArea.endChunkX() - runStartX + 1,
+                    1
+                ));
+            }
+        }
+
+        return areas;
+    }
+
+    private void runDungeonScanAreas(
+        long seed,
+        int javaVersion,
+        String seedText,
+        DungeonScanArea requestedArea,
+        List<DungeonScanArea> areas,
+        int index
+    ) {
+        if (!dungeonScanRunning) return;
+
+        // A newer player/radius/seed request supersedes the remaining pieces of
+        // this logical scan. Keep already-completed pieces in the cache and move
+        // directly to the newest request.
+        if (pendingDungeonScan) {
+            dungeonScanRunning = false;
+            startPendingDungeonScan();
+            return;
+        }
+
+        if (index >= areas.size()) {
+            dungeonScanRunning = false;
+            applyCachedDungeonResults(requestedArea);
+
+            MeteorClient.LOG.info(
+                "[SpawnerHunt] Chunkbase cache scan completed: {} dungeons available within centerChunk=({}, {}), radius={}",
+                predictedDungeons.size(), activeDungeonScanChunkX, activeDungeonScanChunkZ, activeDungeonScanRadius
+            );
+            return;
+        }
+
+        DungeonScanArea area = areas.get(index);
+
+        dungeonFinder.findDungeonsArea(
+            seed,
+            javaVersion,
+            area.startChunkX(),
+            area.startChunkZ(),
+            area.sizeX(),
+            area.sizeZ()
+        ).whenComplete((dungeons, throwable) -> mc.execute(() -> {
+            if (throwable != null) {
+                dungeonScanRunning = false;
+                activeDungeonScanChunkX = Integer.MIN_VALUE;
+                activeDungeonScanChunkZ = Integer.MIN_VALUE;
+                activeDungeonScanSeed = null;
+                activeDungeonScanRadius = -1;
+                MeteorClient.LOG.error("[SpawnerHunt] Dungeon finder failed", throwable);
+
+                if (pendingDungeonScan) {
+                    startPendingDungeonScan();
+                }
+                return;
+            }
+
+            mergeDungeonAreaIntoCache(area, dungeons);
+            trimDungeonCacheIfNeeded();
+
+            MeteorClient.LOG.debug(
+                "[SpawnerHunt] Cached dungeon area startChunk=({}, {}), size={}x{}, returned={}",
+                area.startChunkX(), area.startChunkZ(), area.sizeX(), area.sizeZ(), dungeons.size()
+            );
+
+            if (pendingDungeonScan) {
+                dungeonScanRunning = false;
+                startPendingDungeonScan();
+                return;
+            }
+
+            int currentChunkX = mc.player != null
+                ? Math.floorDiv(mc.player.getBlockX(), 16)
+                : requestedArea.startChunkX() + requestedArea.sizeX() / 2;
+            int currentChunkZ = mc.player != null
+                ? Math.floorDiv(mc.player.getBlockZ(), 16)
+                : requestedArea.startChunkZ() + requestedArea.sizeZ() / 2;
+            String currentSeed = worldSeed.get().trim();
+            int currentRadius = predictionRadius.get();
+
+            boolean requestIsObsolete = currentChunkX != activeDungeonScanChunkX
+                || currentChunkZ != activeDungeonScanChunkZ
+                || !currentSeed.equals(seedText)
+                || currentRadius != activeDungeonScanRadius
+                || (detectionMethod.get() != DetectionMethod.ChunkbasePrediction
+                && detectionMethod.get() != DetectionMethod.DualVerification);
+
+            if (requestIsObsolete) {
+                dungeonScanRunning = false;
+                requestDungeonScan(currentChunkX, currentChunkZ, currentSeed, currentRadius);
+                return;
+            }
+
+            runDungeonScanAreas(seed, javaVersion, seedText, requestedArea, areas, index + 1);
+        }));
+    }
+
+    private void mergeDungeonAreaIntoCache(DungeonScanArea area, List<PredictedDungeon> dungeons) {
+        Map<ChunkKey, List<PredictedDungeon>> byChunk = new HashMap<>();
+
+        for (PredictedDungeon dungeon : dungeons) {
+            ChunkKey key = new ChunkKey(dungeon.chunkX(), dungeon.chunkZ());
+            byChunk.computeIfAbsent(key, ignored -> new ArrayList<>()).add(dungeon);
+        }
+
+        for (int z = area.startChunkZ(); z <= area.endChunkZ(); z++) {
+            for (int x = area.startChunkX(); x <= area.endChunkX(); x++) {
+                ChunkKey key = new ChunkKey(x, z);
+                List<PredictedDungeon> values = byChunk.get(key);
+
+                if (values == null) {
+                    dungeonChunkCache.put(key, List.of());
+                } else {
+                    dungeonChunkCache.put(key, List.copyOf(values));
                 }
 
-                predictedDungeons.clear();
-                predictedDungeons.addAll(dungeons);
+                scannedDungeonChunks.add(key);
+            }
+        }
+    }
 
-                MeteorClient.LOG.info("[SpawnerHunt] Found {} predicted dungeons within 8 chunks of {}, {}.",
-                    dungeons.size(), queryX, queryZ);
+    private void applyCachedDungeonResults(DungeonScanArea requestedArea) {
+        Map<BlockPos, PredictedDungeon> deduplicated = new HashMap<>();
+
+        for (int z = requestedArea.startChunkZ(); z <= requestedArea.endChunkZ(); z++) {
+            for (int x = requestedArea.startChunkX(); x <= requestedArea.endChunkX(); x++) {
+                List<PredictedDungeon> dungeons = dungeonChunkCache.get(new ChunkKey(x, z));
+                if (dungeons == null) continue;
 
                 for (PredictedDungeon dungeon : dungeons) {
-                    MeteorClient.LOG.info("[SpawnerHunt] {} dungeon at {}, {}, {} (chunk {}, {}).",
-                        dungeon.mob(), dungeon.x(), dungeon.y(), dungeon.z(), dungeon.chunkX(), dungeon.chunkZ());
+                    deduplicated.put(
+                        new BlockPos(dungeon.x(), dungeon.y(), dungeon.z()),
+                        dungeon
+                    );
                 }
+            }
+        }
 
-                // Preserve the existing packet method, but now use the actual
-                // dungeon locations returned by BO7jce9YHoxA.js + WASM instead
-                // of the old hand-reimplemented world-generation attempt.
-                if (DungeonPacketmethod.get() && mc.player != null) {
-                    for (PredictedDungeon dungeon : dungeons) {
-                        BlockPos pos = new BlockPos(dungeon.x(), dungeon.y(), dungeon.z());
-                        if (packetedDungeons.contains(pos)) continue;
+        predictedDungeons.clear();
+        predictedDungeons.addAll(deduplicated.values());
 
-                        double distSq = mc.player.distanceToSqr(
-                            dungeon.x() + 0.5,
-                            dungeon.y() + 1.5,
-                            dungeon.z() + 0.5
-                        );
+        invalidPredictedTargets.removeIf(pos -> predictedDungeons.stream().noneMatch(dungeon ->
+            dungeon.x() == pos.getX()
+                && dungeon.y() == pos.getY()
+                && dungeon.z() == pos.getZ()
+        ));
 
-                        if (distSq <= 32.0 * 32.0) {
-                            packetedDungeons.add(pos);
-                            SendDungeonPacket(
-                                dungeon.x() + 0.5,
-                                dungeon.y() + 1.5,
-                                dungeon.z() + 0.5
-                            );
-                        }
-                    }
-                }
-            }));
+        MeteorClient.LOG.info(
+            "[SpawnerHunt] Found {} cached/predicted dungeons within {} chunks of centerChunk {}, {}.",
+            predictedDungeons.size(), activeDungeonScanRadius, activeDungeonScanChunkX, activeDungeonScanChunkZ
+        );
+
+        for (PredictedDungeon dungeon : predictedDungeons) {
+            MeteorClient.LOG.debug(
+                "[SpawnerHunt] {} dungeon at {}, {}, {} (chunk {}, {}).",
+                dungeon.mob(), dungeon.x(), dungeon.y(), dungeon.z(), dungeon.chunkX(), dungeon.chunkZ()
+            );
+        }
+
+        dualVerifiedSpawners.clear();
+    }
+
+    private void startPendingDungeonScan() {
+        if (!pendingDungeonScan) return;
+
+        int chunkX = pendingDungeonScanChunkX;
+        int chunkZ = pendingDungeonScanChunkZ;
+        String seed = pendingDungeonScanSeed;
+        int radius = pendingDungeonScanRadius;
+
+        pendingDungeonScan = false;
+        pendingDungeonScanChunkX = Integer.MIN_VALUE;
+        pendingDungeonScanChunkZ = Integer.MIN_VALUE;
+        pendingDungeonScanSeed = null;
+        pendingDungeonScanRadius = -1;
+
+        if (seed == null) return;
+        requestDungeonScan(chunkX, chunkZ, seed, radius);
     }
 
     private int resolveWorkerJavaVersion() {
@@ -939,23 +1345,96 @@ public class SpawnerHunt extends Module {
         fallbackEntityIdCache.keySet().removeIf(pos -> !seenSpawners.contains(pos));
     }
 
+    private void updateDualVerifiedSpawners() {
+        dualVerifiedSpawners.clear();
+
+        if (predictedDungeons.isEmpty() || matchingSpawners.isEmpty() || mc.level == null) return;
+
+        for (PredictedDungeon dungeon : predictedDungeons) {
+            if (!matchesMobFilter(dungeon.mob())) continue;
+
+            BlockPos pos = new BlockPos(dungeon.x(), dungeon.y(), dungeon.z());
+            if (!matchingSpawners.contains(pos)) continue;
+            if (!mc.level.getBlockState(pos).is(Blocks.SPAWNER)) continue;
+
+            String actualEntityId = fallbackEntityIdCache.get(pos);
+            String expectedEntityId = "minecraft:" + dungeon.mob().toLowerCase(java.util.Locale.ROOT);
+
+            if (expectedEntityId.equals(actualEntityId)) {
+                dualVerifiedSpawners.add(pos);
+            }
+        }
+    }
+
     private BlockPos findNearestSpawner() {
-        if (mc.player == null || mc.level == null || matchingSpawners.isEmpty()) return null;
+        if (mc.player == null || mc.level == null) return null;
 
         BlockPos nearest = null;
         double nearestDistSq = Double.MAX_VALUE;
 
-        for (BlockPos pos : matchingSpawners) {
-            if (unreachableSpawners.contains(pos)) continue;
-            if (!mc.level.getWorldBorder().isWithinBounds(pos)) continue;
-            double distSq = squaredDistanceTo(pos);
-            if (distSq < nearestDistSq) {
-                nearestDistSq = distSq;
-                nearest = pos;
+        if (detectionMethod.get() == DetectionMethod.ChunkbasePrediction) {
+            for (PredictedDungeon dungeon : predictedDungeons) {
+                BlockPos pos = new BlockPos(dungeon.x(), dungeon.y(), dungeon.z());
+                if (invalidPredictedTargets.contains(pos)) continue;
+                if (!matchesMobFilter(dungeon.mob())) continue;
+                if (!mc.level.getWorldBorder().isWithinBounds(pos)) continue;
+
+                double distSq = squaredDistanceTo(pos);
+                if (distSq < nearestDistSq) {
+                    nearestDistSq = distSq;
+                    nearest = pos;
+                }
+            }
+        } else {
+            List<BlockPos> candidates = detectionMethod.get() == DetectionMethod.DualVerification
+                ? dualVerifiedSpawners
+                : matchingSpawners;
+
+            for (BlockPos pos : candidates) {
+                if (unreachableSpawners.contains(pos)) continue;
+                if (!mc.level.getWorldBorder().isWithinBounds(pos)) continue;
+                double distSq = squaredDistanceTo(pos);
+                if (distSq < nearestDistSq) {
+                    nearestDistSq = distSq;
+                    nearest = pos;
+                }
             }
         }
 
         return nearest;
+    }
+
+    private boolean isKnownTarget(BlockPos pos) {
+        if (pos == null) return false;
+
+        if (detectionMethod.get() == DetectionMethod.WorldScan) {
+            return matchingSpawners.contains(pos);
+        }
+
+        if (detectionMethod.get() == DetectionMethod.DualVerification) {
+            return dualVerifiedSpawners.contains(pos);
+        }
+
+        if (invalidPredictedTargets.contains(pos)) return false;
+
+        for (PredictedDungeon dungeon : predictedDungeons) {
+            if (dungeon.x() == pos.getX()
+                && dungeon.y() == pos.getY()
+                && dungeon.z() == pos.getZ()
+                && matchesMobFilter(dungeon.mob())) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean matchesMobFilter(String mobName) {
+        List<String> filters = mobFilter.get();
+        if (filters.isEmpty()) return false;
+
+        String entityId = "minecraft:" + mobName.toLowerCase(java.util.Locale.ROOT);
+        return filters.contains(entityId);
     }
 
     private boolean shouldReroute(BlockPos candidate) {
@@ -1055,29 +1534,53 @@ public class SpawnerHunt extends Module {
 
     @EventHandler
     private void onRender3d(Render3DEvent event) {
-        if (mc.level == null || mc.player == null || (matchingSpawners.isEmpty() && predictedDungeons.isEmpty()) || RenderUtils.center == null) return;
+        if (mc.level == null || mc.player == null || RenderUtils.center == null) return;
 
-        for (BlockPos pos : matchingSpawners) {
-            if (box.get()) {
+        if (detectionMethod.get() == DetectionMethod.WorldScan) {
+            for (BlockPos pos : matchingSpawners) {
+                if (box.get()) {
+                    event.renderer.box(pos, boxColor.get(), boxColor.get(), ShapeMode.Both, 0);
+                }
+
+                if (tracers.get()) {
+                    double x = pos.getX() + 0.5;
+                    double y = pos.getY() + 0.5;
+                    double z = pos.getZ() + 0.5;
+
+                    event.renderer.line(RenderUtils.center.x, RenderUtils.center.y, RenderUtils.center.z, x, y, z, tracerColor.get());
+                }
+            }
+            return;
+        }
+
+        if (detectionMethod.get() == DetectionMethod.DualVerification) {
+            for (BlockPos pos : dualVerifiedSpawners) {
+                if (predictionBox.get()) {
+                    event.renderer.box(pos, boxColor.get(), boxColor.get(), ShapeMode.Both, 0);
+                }
+
+                if (predictionTracers.get()) {
+                    double x = pos.getX() + 0.5;
+                    double y = pos.getY() + 0.5;
+                    double z = pos.getZ() + 0.5;
+                    event.renderer.line(RenderUtils.center.x, RenderUtils.center.y, RenderUtils.center.z, x, y, z, tracerColor.get());
+                }
+            }
+            return;
+        }
+
+        // In Chunkbase mode these are predicted spawner coordinates, so render
+        // them as the active targets rather than as the old method's results.
+        for (PredictedDungeon dungeon : predictedDungeons) {
+            if (!matchesMobFilter(dungeon.mob())) continue;
+
+            BlockPos pos = new BlockPos(dungeon.x(), dungeon.y(), dungeon.z());
+
+            if (predictionBox.get()) {
                 event.renderer.box(pos, boxColor.get(), boxColor.get(), ShapeMode.Both, 0);
             }
 
-            if (tracers.get()) {
-                double x = pos.getX() + 0.5;
-                double y = pos.getY() + 0.5;
-                double z = pos.getZ() + 0.5;
-
-                event.renderer.line(RenderUtils.center.x, RenderUtils.center.y, RenderUtils.center.z, x, y, z, tracerColor.get());
-            }
-        }
-
-        // Render predicted dungeon positions as thin target markers.
-        // Actual spawners remain the authoritative targets for mining/pathing.
-        for (PredictedDungeon dungeon : predictedDungeons) {
-            BlockPos pos = new BlockPos(dungeon.x(), dungeon.y(), dungeon.z());
-            event.renderer.box(pos, boxColor.get(), boxColor.get(), ShapeMode.Lines, 0);
-
-            if (tracers.get()) {
+            if (predictionTracers.get()) {
                 double x = dungeon.x() + 0.5;
                 double y = dungeon.y() + 0.5;
                 double z = dungeon.z() + 0.5;
@@ -1101,8 +1604,6 @@ public class SpawnerHunt extends Module {
         private static final String WORKER_RESOURCE = "/dungeon/BO7jce9YHoxA.js";
         private static final String WASM_SIMD_RESOURCE = "/dungeon/C4q1boG87vQ4.simd.wasm";
         private static final String WASM_FALLBACK_RESOURCE = "/dungeon/BIhsZSp9IFGv.wasm";
-        private static final int RADIUS_CHUNKS = 8;
-
         private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
             Thread thread = new Thread(r, "SpawnerHunt-DungeonFinder");
             thread.setDaemon(true);
@@ -1126,7 +1627,14 @@ public class SpawnerHunt extends Module {
             initialization = CompletableFuture.runAsync(this::initialize, executor);
         }
 
-        CompletableFuture<List<PredictedDungeon>> findDungeons(long seed, int javaVersion, int blockX, int blockZ) {
+        CompletableFuture<List<PredictedDungeon>> findDungeonsArea(
+            long seed,
+            int javaVersion,
+            int startChunkX,
+            int startChunkZ,
+            int sizeX,
+            int sizeZ
+        ) {
             CompletableFuture<List<PredictedDungeon>> result = new CompletableFuture<>();
 
             initialization.whenComplete((ignored, initError) -> {
@@ -1141,8 +1649,10 @@ public class SpawnerHunt extends Module {
                             Value promise = findDungeonsFunction.execute(
                                 Long.toString(seed),
                                 javaVersion,
-                                blockX,
-                                blockZ
+                                startChunkX,
+                                startChunkZ,
+                                sizeX,
+                                sizeZ
                             );
 
                             // getPois() is asynchronous in the original worker.
@@ -1243,7 +1753,7 @@ public class SpawnerHunt extends Module {
 
                     %s
 
-                    globalThis.__findDungeons = async function(seed, javaVersion, x, z) {
+                    globalThis.__findDungeons = async function(seed, javaVersion, startChunkX, startChunkZ, sizeX, sizeZ) {
                         const startedAt = Date.now();
                         console.log("[SpawnerHunt] Chunkbase scan started");
                         const world = {
@@ -1257,22 +1767,16 @@ public class SpawnerHunt extends Module {
                             }
                         };
 
-                        const centerChunkX = Math.floor(x / 16);
-                        const centerChunkZ = Math.floor(z / 16);
-
-                        // Full scan: 8 chunks in each direction from the
-                        // player's current chunk, giving a 17x17 chunk area.
-                        const radiusChunks = 8;
-                        const startChunkX = centerChunkX - radiusChunks;
-                        const startChunkZ = centerChunkZ - radiusChunks;
-                        const scanSize = radiusChunks * 2 + 1;
+                        startChunkX = Math.trunc(Number(startChunkX));
+                        startChunkZ = Math.trunc(Number(startChunkZ));
+                        sizeX = Math.max(1, Math.trunc(Number(sizeX)));
+                        sizeZ = Math.max(1, Math.trunc(Number(sizeZ)));
 
                         console.log(
                             "[SpawnerHunt] Chunkbase query: seed=" + String(seed) +
                             ", javaVersion=" + javaVersion +
-                            ", centerChunk=(" + centerChunkX + ", " + centerChunkZ + ")" +
                             ", startChunk=(" + startChunkX + ", " + startChunkZ + ")" +
-                            ", size=" + scanSize + "x" + scanSize
+                            ", size=" + sizeX + "x" + sizeZ
                         );
 
                         // The original Chunkbase worker initializes its WASM module
@@ -1286,8 +1790,8 @@ public class SpawnerHunt extends Module {
                             ["dungeon"],
                             startChunkX,
                             startChunkZ,
-                            scanSize,
-                            scanSize
+                            sizeX,
+                            sizeZ
                         );
 
                         console.log("[SpawnerHunt] Chunkbase getPois completed in " + (Date.now() - startedAt) + " ms");

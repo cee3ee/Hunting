@@ -69,8 +69,7 @@ Hunter is a Meteor Client addon that automates the process of finding, traveling
 ```
 
 ## TODOs
-- [ ] Add unit tests for spawner detection logic.
-- [ ] Test new seed method of dungeon calculation wirh different anti esps
+- [x] Test new seed method of dungeon calculation wirh different anti esps
 - [ ] Test on aternos server for anti cheat detections
 
 ## License
