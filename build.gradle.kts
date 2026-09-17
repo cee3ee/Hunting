@@ -4,7 +4,9 @@ plugins {
 
 base {
     archivesName = properties["archives_base_name"] as String
-    version = libs.versions.mod.version.get()
+    version = providers.gradleProperty("mod_version")
+        .orElse(libs.versions.mod.version)
+        .get()
     group = properties["maven_group"] as String
 }
 
@@ -43,6 +45,17 @@ dependencies {
     graalCompile("org.graalvm.polyglot:wasm:25.3.4.1")
 }
 
+graalCompile.resolvedConfiguration.resolvedArtifacts
+    .filter { it.type == "jar" }
+    .forEach {
+        val id = it.moduleVersion.id
+
+        dependencies.add(
+            "include",
+            "${id.group}:${id.name}:${id.version}"
+        )
+    }
+
 java {
     toolchain {
         languageVersion.set(
@@ -61,6 +74,7 @@ fun toMinecraftCompat(version: String): String {
 }
 
 val graalJars = graalCompile.filter { it.extension == "jar" }
+
 
 tasks {
     withType<JavaCompile>().configureEach {

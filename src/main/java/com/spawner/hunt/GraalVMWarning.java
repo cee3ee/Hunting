@@ -29,30 +29,78 @@ public class GraalVMWarning {
 
     public GraalVMWarning() {
         MeteorClient.EVENT_BUS.subscribe(this);
+
+        MeteorClient.LOG.info(
+            "Hunter Java runtime: version={}, vendor={}, vendorVersion={}, runtime={}, vm={}, home={}",
+            System.getProperty("java.version", ""),
+            System.getProperty("java.vendor", ""),
+            System.getProperty("java.vendor.version", ""),
+            System.getProperty("java.runtime.name", ""),
+            System.getProperty("java.vm.name", ""),
+            System.getProperty("java.home", "")
+        );
     }
 
     /**
-     * Checks whether the current Minecraft JVM is Java 25
-     * and contains the GraalVM Polyglot API.
+     * Checks whether Minecraft is running on GraalVM JDK 25.
      */
-    public static boolean isGraalVM25Available() {
-        String javaVersion = System.getProperty("java.version", "");
+    public static boolean isGraalVM25() {
+        String javaVersion = System.getProperty(
+            "java.version",
+            ""
+        );
 
+        // Hunter specifically targets Java 25.
         if (!javaVersion.startsWith("25.")) {
             return false;
         }
 
-        try {
-            Class.forName(
-                "org.graalvm.polyglot.Context",
-                false,
-                GraalVMWarning.class.getClassLoader()
-            );
+        String javaVendor = System.getProperty(
+            "java.vendor",
+            ""
+        );
 
-            return true;
-        } catch (ClassNotFoundException | LinkageError e) {
-            return false;
-        }
+        String javaVendorVersion = System.getProperty(
+            "java.vendor.version",
+            ""
+        );
+
+        String javaRuntimeName = System.getProperty(
+            "java.runtime.name",
+            ""
+        );
+
+        String javaVmName = System.getProperty(
+            "java.vm.name",
+            ""
+        );
+
+        String javaVmVendor = System.getProperty(
+            "java.vm.vendor",
+            ""
+        );
+
+        String javaVmVersion = System.getProperty(
+            "java.vm.version",
+            ""
+        );
+
+        String javaHome = System.getProperty(
+            "java.home",
+            ""
+        );
+
+        String runtimeInfo = (
+            javaVendor + " " +
+                javaVendorVersion + " " +
+                javaRuntimeName + " " +
+                javaVmName + " " +
+                javaVmVendor + " " +
+                javaVmVersion + " " +
+                javaHome
+        ).toLowerCase();
+
+        return runtimeInfo.contains("graalvm");
     }
 
     private boolean wasWarningShown() {
@@ -75,37 +123,34 @@ public class GraalVMWarning {
         }
     }
 
-    /**
-     * Opens the Hunter README in the user's default browser.
-     */
     private static void openReadme() {
         try {
-            String os = System.getProperty("os.name", "").toLowerCase();
+            String os = System.getProperty(
+                "os.name",
+                ""
+            ).toLowerCase();
 
             if (os.contains("win")) {
-                // Windows
                 new ProcessBuilder(
                     "rundll32",
                     "url.dll,FileProtocolHandler",
                     README_URL
                 ).start();
-
-            } else if (os.contains("mac")) {
-                // macOS
+            }
+            else if (os.contains("mac")) {
                 new ProcessBuilder(
                     "open",
                     README_URL
                 ).start();
-
-            } else {
-                // Linux and other Unix-like systems
+            }
+            else {
                 new ProcessBuilder(
                     "xdg-open",
                     README_URL
                 ).start();
             }
-
-        } catch (Exception e) {
+        }
+        catch (Exception e) {
             MeteorClient.LOG.error(
                 "Failed to open Hunter README.",
                 e
@@ -117,13 +162,13 @@ public class GraalVMWarning {
     private void onTick(TickEvent.Post event) {
         if (warningOpened) return;
 
-        // GraalVM is available, so no warning is needed.
-        if (isGraalVM25Available()) return;
+        // Correct runtime.
+        if (isGraalVM25()) return;
 
-        // Don't show the warning repeatedly.
+        // Warning has already been acknowledged.
         if (wasWarningShown()) return;
 
-        // Wait until the title screen is visible.
+        // Only show it from the title screen.
         if (!(Minecraft.getInstance().screen instanceof TitleScreen)) {
             return;
         }
@@ -155,10 +200,14 @@ public class GraalVMWarning {
             int buttonWidth = 150;
             int buttonHeight = 20;
 
-            int firstButtonX = centerX - buttonWidth - 5;
-            int secondButtonX = centerX + 5;
+            int firstButtonX =
+                centerX - buttonWidth - 5;
 
-            int buttonY = this.height - 65;
+            int secondButtonX =
+                centerX + 5;
+
+            int buttonY =
+                this.height - 65;
 
             // Open README
             this.addRenderableWidget(
@@ -179,7 +228,9 @@ public class GraalVMWarning {
             this.addRenderableWidget(
                 Button.builder(
                         Component.literal("Continue Anyway"),
-                        button -> Minecraft.getInstance().setScreen(null)
+                        button ->
+                            Minecraft.getInstance()
+                                .setScreen(null)
                     )
                     .bounds(
                         secondButtonX,
@@ -194,7 +245,8 @@ public class GraalVMWarning {
             this.addRenderableWidget(
                 Button.builder(
                         Component.literal("Quit"),
-                        button -> Minecraft.getInstance().stop()
+                        button ->
+                            Minecraft.getInstance().stop()
                     )
                     .bounds(
                         centerX - buttonWidth / 2,
@@ -222,39 +274,38 @@ public class GraalVMWarning {
 
             int centerX = this.width / 2;
 
-            // Title
+            String title =
+                "Hunter - GraalVM JDK 25 Required";
+
             graphics.text(
                 this.font,
-                "Hunter - GraalVM JDK 25 Required",
-                centerX - this.font.width(
-                    "Hunter - GraalVM JDK 25 Required"
-                ) / 2,
+                title,
+                centerX - this.font.width(title) / 2,
                 30,
                 0xFFFFFFFF,
                 true
             );
 
-            // Message
             int y = 60;
 
             String[] lines = {
                 "Hunter is not running on GraalVM JDK 25.",
                 "",
-                "The Chunkbase/seed-based dungeon finder requires",
-                "the GraalVM Polyglot runtime.",
+                "The Chunkbase/seed-based dungeon finder",
+                "requires the GraalVM runtime.",
                 "",
-                "Without GraalVM JDK 25, seed-based dungeon",
-                "detection will NOT work and calculations will fail.",
+                "Without GraalVM JDK 25, the full Chunkbase",
+                "dungeon calculation system will not work",
+                "as intended.",
                 "",
-                "You can continue using Minecraft, but the full",
-                "Chunkbase functionality will be unavailable.",
-                "",
-                "Install GraalVM JDK 25 using the instructions",
-                "in the Hunter README."
+                "Install GraalVM JDK 25 and configure",
+                "Minecraft to use it before using Hunter."
             };
 
             for (String line : lines) {
-                int x = centerX - this.font.width(line) / 2;
+                int x =
+                    centerX -
+                        this.font.width(line) / 2;
 
                 graphics.text(
                     this.font,
