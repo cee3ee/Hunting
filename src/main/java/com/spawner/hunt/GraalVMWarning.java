@@ -12,9 +12,7 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.network.chat.Component;
 
-import java.awt.Desktop;
 import java.io.IOException;
-import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -82,16 +80,30 @@ public class GraalVMWarning {
      */
     private static void openReadme() {
         try {
-            if (!Desktop.isDesktopSupported()) {
-                MeteorClient.LOG.error(
-                    "Desktop API is not supported; cannot open README."
-                );
-                return;
-            }
+            String os = System.getProperty("os.name", "").toLowerCase();
 
-            Desktop.getDesktop().browse(
-                new URI(README_URL)
-            );
+            if (os.contains("win")) {
+                // Windows
+                new ProcessBuilder(
+                    "rundll32",
+                    "url.dll,FileProtocolHandler",
+                    README_URL
+                ).start();
+
+            } else if (os.contains("mac")) {
+                // macOS
+                new ProcessBuilder(
+                    "open",
+                    README_URL
+                ).start();
+
+            } else {
+                // Linux and other Unix-like systems
+                new ProcessBuilder(
+                    "xdg-open",
+                    README_URL
+                ).start();
+            }
 
         } catch (Exception e) {
             MeteorClient.LOG.error(
