@@ -25,3 +25,6 @@ bin/
 
 # Fabric / Minecraft
 run/
+
+# GraalVM JDK archives
+*.tar.gz
