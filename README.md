@@ -176,3 +176,4 @@ To run the Minecraft client with the mod loaded for testing:
 ## License
 
 This project is licensed under the [CC0 1.0 Universal](LICENSE) license. Feel free to use it for your own projects.
+ 
