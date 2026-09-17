@@ -1,81 +1,97 @@
 name: Build and Release
 
 on:
-push:
-tags:
-  - "v*"
+  push:
+    tags:
+      - "v*"
 
-workflow_dispatch:
-inputs:
-version:
-description: "Release version, e.g. 1.0.0"
-required: true
-type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 1.0.0"
+        required: true
+        type: string
 
 permissions:
-contents: write
+  contents: write
 
 jobs:
-build-and-release:
-runs-on: ubuntu-latest
+  build-and-release:
+    runs-on: ubuntu-latest
 
-  ```
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v7
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-  - name: Resolve version
-    id: version
-    shell: bash
-    run: |
-      if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-        VERSION="${GITHUB_REF_NAME#v}"
-      else
-        VERSION="${{ inputs.version }}"
-      fi
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
 
-      if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "Invalid version: $VERSION"
-        echo "Expected format: 1.0.0"
-        exit 1
-      fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version: $VERSION"
+            echo "Expected format: 1.0.0"
+            exit 1
+          fi
 
-      TAG="v${VERSION}"
+          TAG="v${VERSION}"
 
-      echo "Version: $VERSION"
-      echo "Tag: $TAG"
+          echo "Version: $VERSION"
+          echo "Tag: $TAG"
 
-      echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
 
-  - name: Set up JDK 25
-    uses: actions/setup-java@v6
-    with:
-      distribution: temurin
-      java-version: "25"
-      cache: gradle
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: gradle
 
-  - name: Make Gradle wrapper executable
-    run: chmod +x ./gradlew
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
 
-  - name: Build
-    run: ./gradlew clean build -Pmod_version="${{ steps.version.outputs.version }}"
+      - name: Build
+        run: ./gradlew clean build -Pmod_version="${{ steps.version.outputs.version }}"
 
-  - name: Upload build artifact
-    uses: actions/upload-artifact@v4
-    with:
-      name: hunting-${{ steps.version.outputs.tag_name }}
-      path: build/libs/*.jar
-      if-no-files-found: error
+      - name: Verify bundled Graal dependencies
+        shell: bash
+        run: |
+          JAR=$(find build/libs -name "*.jar" | head -n 1)
 
-  - name: Create GitHub release
-    uses: softprops/action-gh-release@v3
-    with:
-      tag_name: ${{ steps.version.outputs.tag_name }}
-      name: Hunter ${{ steps.version.outputs.tag_name }}
-      files: build/libs/*.jar
-      generate_release_notes: true
-      fail_on_unmatched_files: true
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if [[ -z "$JAR" ]]; then
+            echo "No JAR found."
+            exit 1
+          fi
 
+          echo "Checking $JAR"
+
+          jar tf "$JAR" | grep -q "META-INF/jars/polyglot-"
+          jar tf "$JAR" | grep -q "META-INF/jars/js-language-"
+          jar tf "$JAR" | grep -q "META-INF/jars/wasm-language-"
+
+          echo "GraalVM dependencies successfully bundled."
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hunting-${{ steps.version.outputs.tag_name }}
+          path: build/libs/*.jar
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag_name }}
+          name: Hunter ${{ steps.version.outputs.tag_name }}
+          files: build/libs/*.jar
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
