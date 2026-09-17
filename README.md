@@ -133,7 +133,7 @@ config/hunter/
 Clone the repository:
 
 ```bash
-git clone https://github.com/Meteor-Hunting/Hunting.git
+git clone https://github.com/cee3ee/Hunting.git
 cd Hunting
 ```
 
