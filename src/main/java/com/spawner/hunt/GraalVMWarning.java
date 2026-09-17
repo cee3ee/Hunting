@@ -27,32 +27,36 @@ public class GraalVMWarning {
     }
 
     /**
-     * Checks whether Minecraft is currently running on GraalVM JDK 25.
+     * Checks whether the JVM currently running Minecraft is Java 25
+     * and has the GraalVM Polyglot API available.
+     *
+     * We deliberately use Class.forName() with a String so that
+     * referencing this class does not itself cause a NoClassDefFoundError.
      */
-    private boolean isGraalVM25() {
+    public static boolean isGraalVM25Available() {
         String javaVersion = System.getProperty("java.version", "");
-        String javaVmVendor = System.getProperty("java.vm.vendor", "");
-        String javaVendorVersion = System.getProperty("java.vendor.version", "");
 
-        boolean java25 = javaVersion.startsWith("25.");
+        if (!javaVersion.startsWith("25.")) {
+            return false;
+        }
 
-        boolean graalVM =
-            javaVmVendor.toLowerCase().contains("graalvm")
-                || javaVendorVersion.toLowerCase().contains("graalvm");
+        try {
+            Class.forName(
+                "org.graalvm.polyglot.Context",
+                false,
+                GraalVMWarning.class.getClassLoader()
+            );
 
-        return java25 && graalVM;
+            return true;
+        } catch (ClassNotFoundException | LinkageError e) {
+            return false;
+        }
     }
 
-    /**
-     * Checks whether the warning has already been shown.
-     */
     private boolean wasWarningShown() {
         return Files.exists(WARNING_FILE);
     }
 
-    /**
-     * Saves a file so the warning isn't shown again.
-     */
     private void markWarningShown() {
         try {
             Files.createDirectories(WARNING_FILE.getParent());
@@ -70,16 +74,15 @@ public class GraalVMWarning {
 
     @EventHandler
     private void onTick(TickEvent.Post event) {
-        // Don't do anything if we've already opened the warning this session.
         if (warningOpened) return;
 
-        // GraalVM is being used, so no warning is needed.
-        if (isGraalVM25()) return;
+        // Correct runtime: nothing to warn about.
+        if (isGraalVM25Available()) return;
 
-        // Don't show the warning again after it has already been acknowledged.
+        // Already shown previously.
         if (wasWarningShown()) return;
 
-        // Wait until the title screen is visible.
+        // Wait for the title screen.
         if (!(Minecraft.getInstance().screen instanceof TitleScreen)) return;
 
         warningOpened = true;
@@ -92,24 +95,25 @@ public class GraalVMWarning {
                         // Continue into Minecraft.
                         Minecraft.getInstance().setScreen(null);
                     } else {
-                        // Exit Minecraft.
+                        // Quit Minecraft.
                         Minecraft.getInstance().stop();
                     }
                 },
 
-                Component.literal("Hunter - GraalVM JDK 25 Recommended"),
+                Component.literal(
+                    "Hunter Requires GraalVM JDK 25"
+                ),
 
                 Component.literal(
                     "Hunter is not running on GraalVM JDK 25.\n\n" +
-                        "Hunter's seed-based spawner detection uses JavaScript " +
-                        "and WebAssembly. Without GraalVM's optimizing runtime, " +
-                        "these calculations can be significantly slower.\n\n" +
-                        "This may result in slower spawner prediction and longer " +
-                        "calculation times, especially when scanning large areas.\n\n" +
-                        "Hunter can still run on a standard JDK 25, but GraalVM JDK 25 " +
-                        "is strongly recommended for the best performance.\n\n" +
-                        "You can install GraalVM JDK 25 and configure Minecraft to " +
-                        "use it later."
+                        "IMPORTANT: Hunter's Chunkbase/seed-based dungeon " +
+                        "finder requires the GraalVM Polyglot runtime.\n\n" +
+                        "Without GraalVM JDK 25, this feature will NOT work " +
+                        "and dungeon calculations will fail.\n\n" +
+                        "The rest of Hunter may continue to function, but " +
+                        "seed-based spawner detection will be unavailable.\n\n" +
+                        "Install GraalVM JDK 25 and configure Minecraft to use " +
+                        "it for the full Hunter experience."
                 ),
 
                 Component.literal("Continue Anyway"),

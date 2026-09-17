@@ -8,10 +8,8 @@ public class Hunters extends MeteorAddon {
 
     @Override
     public void onInitialize() {
-        // Register the GraalVM warning.
         new GraalVMWarning();
 
-        // Register your module.
         Modules.get().add(new SpawnerHunt());
     }
 
