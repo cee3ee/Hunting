@@ -22,6 +22,9 @@ It integrates with Baritone for pathfinding and includes multiple methods of loc
 * **Pickup Verification**: Verifies that a mined spawner was actually collected and attempts to collect dropped items.
 * **First-Launch Runtime Check**: Warns the player if Minecraft is not running on the required GraalVM JDK 25 runtime.
 
+> **Attribution:** Hunter's dungeon prediction functionality is based on work by the Chunk Base team and contributors. See [Credits & Attribution](#credits--attribution).
+
+
 ## Requirements
 
 * **Minecraft**: 26.1.2
@@ -240,6 +243,29 @@ If those errors are present, verify the Minecraft Java executable first.
 * [ ] Test on Aternos servers for anti-cheat detections.
 * [ ] Improve first-launch GraalVM setup screen.
 * [ ] Add a direct "Install GraalVM" button to the runtime warning.
+
+## Credits & Attribution
+
+Hunter's seed-based dungeon detection is based on and inspired by the work of **Chunk Base** and its **Dungeon Finder**:
+
+* **Chunk Base** — https://www.chunkbase.com/
+* **Chunk Base Dungeon Finder** — https://www.chunkbase.com/apps/dungeon-finder
+
+The developers and contributors behind Chunk Base deserve credit for the original dungeon-finding research, implementation, and supporting work that makes this functionality possible.
+
+Additional contributors credited by Chunk Base for work used across its apps include:
+
+* **amidst contributors** — biome colours
+* **Earthcomputer** — `bedrockified`
+* **protolambda** — slime chunk algorithm research
+* **jocopa3** — slime chunk algorithm research
+* **depressed-pho** — JavaScript porting work
+
+Hunter is an independent project and is **not affiliated with, endorsed by, or officially associated with Chunk Base**.
+
+For the original credits and attribution, see the [Chunk Base Dungeon Finder](https://www.chunkbase.com/apps/dungeon-finder).
+
+## License
 
 ## License
 
