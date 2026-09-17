@@ -1,5 +1,5 @@
 # Hunter
-READ: (https://github.com/derdevil1232/Hunting/issues/1)
+READ: (https://github.com/cee3ee/Hunting/issues/1)
 An addon for [Meteor Client](https://github.com/MeteorDevelopment/meteor-client) focused on hunting spawners in Minecraft.
 
 ## Overview
